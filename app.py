@@ -84,8 +84,11 @@ def get_seating_plan(df):
     return pd.DataFrame(seating_results), raw_assignments, unassigned
 
 def create_pdf(seating_df, raw_assignments):
-    """Generates a PDF with one room per page, summary lists, and bordered tables."""
+    """Generates a PDF with explicit margin boundaries to prevent horizontal space errors."""
     pdf = FPDF(orientation="P", unit="mm", format="A4")
+    
+    # 1. EXPLICITLY SET ALL MARGINS
+    pdf.set_margins(left=15, top=15, right=15)
     pdf.set_auto_page_break(auto=True, margin=15)
     
     rooms = seating_df['Room'].unique()
@@ -104,7 +107,6 @@ def create_pdf(seating_df, raw_assignments):
         pdf.set_font("helvetica", "", 12)
         room_students = [s for s in raw_assignments if s['Room'] == room]
         
-        # Group data
         summary = defaultdict(lambda: defaultdict(list))
         for s in room_students:
             summary[s['Class']][s['Gender']].append(int(s['Roll']))
@@ -115,14 +117,16 @@ def create_pdf(seating_df, raw_assignments):
                 roll_str = ", ".join(map(str, rolls))
                 count = len(rolls)
                 
-                # Format: CLASS - V: BOYS - 1, 2, 3 = 03
                 line = f"CLASS - {cls}: {gender} - {roll_str} = {count:02d}"
-                pdf.multi_cell(0, 8, line)
+                pdf.multi_cell(w=0, h=8, txt=line) # w=0 respects the margins automatically
                 
         pdf.ln(10)
         
-        # --- SEATING TABLE WITH IMAGE OUTLINE (BORDERS) ---
+        # --- SEATING TABLE WITH ALIGNED BORDERS ---
         room_df = seating_df[seating_df['Room'] == room]
+        
+        # 2. EXACT WIDTH CALCULATION: 15 + 55 + 55 + 55 = 180mm (fits perfectly inside 210mm A4 minus 30mm margins)
+        col_widths = [15, 55, 55, 55] 
         
         for col_name in room_df['Column'].unique():
             # Column Title
@@ -133,12 +137,12 @@ def create_pdf(seating_df, raw_assignments):
             
             # Table Headers
             pdf.set_font("helvetica", "B", 10)
-            col_widths = [20, 55, 55, 55] # Total = 185mm (fits A4 nicely)
             headers = ["Bench", "Left Seat", "Middle Seat", "Right Seat"]
             
             for i, header in enumerate(headers):
-                pdf.cell(col_widths[i], 10, header, border=1, align="C")
-            pdf.ln()
+                is_last = (i == len(headers) - 1)
+                # ln=1 ONLY on the last column to carriage-return to the next row
+                pdf.cell(col_widths[i], 10, header, border=1, align="C", ln=1 if is_last else 0)
             
             # Table Rows
             pdf.set_font("helvetica", "", 10)
@@ -146,12 +150,10 @@ def create_pdf(seating_df, raw_assignments):
                 pdf.cell(col_widths[0], 10, str(row['Bench No']), border=1, align="C")
                 pdf.cell(col_widths[1], 10, str(row['Left Seat']), border=1, align="C")
                 pdf.cell(col_widths[2], 10, str(row['Middle Seat']), border=1, align="C")
-                pdf.cell(col_widths[3], 10, str(row['Right Seat']), border=1, align="C")
-                pdf.ln()
+                pdf.cell(col_widths[3], 10, str(row['Right Seat']), border=1, align="C", ln=1) # Note the ln=1 here
                 
             pdf.ln(5) # Space between columns
             
-    # Output to byte string for Streamlit download
     return bytes(pdf.output())
 
 # --- UI START ---

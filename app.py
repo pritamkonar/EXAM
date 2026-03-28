@@ -437,95 +437,7 @@ def main():
 
     st.success(f"✅ Loaded **{len(df):,}** students to process.")
 
-    # 3. Manual Room Layout Editor
-    st.subheader("🚪 Room Configuration")
-    st.markdown("Add rooms and define their seating layout. In the Layout column, enter the number of benches per column separated by commas (e.g., `6,9` means two columns of 6 and 9 benches).")
-    
-    # Default Room Data
-    default_rooms = pd.DataFrame([
-        {"Room Name": "Room 1", "Layout (comma separated)": "11,11"},
-        {"Room Name": "Room 2", "Layout (comma separated)": "6,6"},
-        {"Room Name": "Room 3", "Layout (comma separated)": "7,6"},
-        {"Room Name": "Room 4", "Layout (comma separated)": "6,6"},
-        {"Room Name": "Room 5", "Layout (comma separated)": "9,9"}
-    ])
-    
-    edited_room_df = st.data_editor(default_rooms, num_rows="dynamic", use_container_width=True)
-    
-    # Parse Edited Room Config
-    rooms_config = []
-    total_system_capacity = 0
-    for _, row in edited_room_df.iterrows():
-        name = str(row["Room Name"]).strip()
-        layout_str = str(row["Layout (comma separated)"]).strip()
-        
-        if not name or not layout_str: continue
-        
-        try:
-            # Parse commas or colons
-            layout_str = layout_str.replace(":", ",")
-            cols = [int(c.strip()) for c in layout_str.split(",") if c.strip().isdigit()]
-            if cols:
-                room_cap = sum(cols) * 3
-                total_system_capacity += room_cap
-                rooms_config.append({
-                    "name": name,
-                    "cols": cols,
-                    "capacity": room_cap
-                })
-        except ValueError:
-            st.error(f"Invalid layout format in {name}. Please use numbers separated by commas.")
-            return
-
-    st.info(f"🪑 **Total System Capacity:** {total_system_capacity} Seats | **Total Students:** {len(df)}")
-    if len(df) > total_system_capacity:
-        st.error(f"⚠️ Warning: Not enough seats! You are short by {len(df) - total_system_capacity} seats. Add more rooms or rows.")
-
-    # Distribute Data
-    allocated_rooms, unassigned = distribute_to_rooms(df, rooms_config, separate_genders)
-
-    if unassigned:
-        st.error(f"⚠️ {len(unassigned)} students could not be seated due to lack of space or strict gender isolation rules.")
-        with st.expander("View Unassigned Students"):
-            st.dataframe(unassigned)
-
-    # Room Preview Summary
-    st.subheader("📊 Allocation Preview")
-    preview_data = []
-    for config in rooms_config:
-        r_name = config["name"]
-        students = allocated_rooms[r_name]
-        b_count = sum(1 for s in students if s["gender"] == "BOYS")
-        g_count = sum(1 for s in students if s["gender"] == "GIRLS")
-        preview_data.append({
-            "Room Name": r_name,
-            "Assigned Boys": b_count,
-            "Assigned Girls": g_count,
-            "Total Occupied": f"{len(students)} / {config['capacity']}"
-        })
-    st.dataframe(pd.DataFrame(preview_data).set_index("Room Name"), use_container_width=True)
-
-    # Generate PDF
-    if st.button("🖨️ Generate Seating Arrangement PDF", type="primary"):
-        with st.spinner("Calculating matrices and rendering PDF..."):
-            try:
-                pdf_buf = generate_pdf(allocated_rooms, rooms_config)
-                st.balloons()
-                st.download_button(
-                    label="📥 Download Seating PDF",
-                    data=pdf_buf,
-                    file_name="Custom_Seating_Arrangement.pdf",
-                    mime="application/pdf",
-                    use_container_width=True
-                )
-            except Exception as e:
-                st.error(f"PDF generation failed: {e}")
-                st.exception(e)
-
-if __name__ == "__main__":
-    main()
-
-# =========================================================================
+    # =========================================================================
     # 4. NEW FEATURE: CLASS SUMMARY & STUDENT LISTS
     # =========================================================================
     st.markdown("---")
@@ -679,3 +591,91 @@ if __name__ == "__main__":
         )
         st.markdown("---")
     # =========================================================================
+
+    # 3. Manual Room Layout Editor
+    st.subheader("🚪 Room Configuration")
+    st.markdown("Add rooms and define their seating layout. In the Layout column, enter the number of benches per column separated by commas (e.g., `6,9` means two columns of 6 and 9 benches).")
+    
+    # Default Room Data
+    default_rooms = pd.DataFrame([
+        {"Room Name": "Room 1", "Layout (comma separated)": "11,11"},
+        {"Room Name": "Room 2", "Layout (comma separated)": "6,6"},
+        {"Room Name": "Room 3", "Layout (comma separated)": "7,6"},
+        {"Room Name": "Room 4", "Layout (comma separated)": "6,6"},
+        {"Room Name": "Room 5", "Layout (comma separated)": "9,9"}
+    ])
+    
+    edited_room_df = st.data_editor(default_rooms, num_rows="dynamic", use_container_width=True)
+    
+    # Parse Edited Room Config
+    rooms_config = []
+    total_system_capacity = 0
+    for _, row in edited_room_df.iterrows():
+        name = str(row["Room Name"]).strip()
+        layout_str = str(row["Layout (comma separated)"]).strip()
+        
+        if not name or not layout_str: continue
+        
+        try:
+            # Parse commas or colons
+            layout_str = layout_str.replace(":", ",")
+            cols = [int(c.strip()) for c in layout_str.split(",") if c.strip().isdigit()]
+            if cols:
+                room_cap = sum(cols) * 3
+                total_system_capacity += room_cap
+                rooms_config.append({
+                    "name": name,
+                    "cols": cols,
+                    "capacity": room_cap
+                })
+        except ValueError:
+            st.error(f"Invalid layout format in {name}. Please use numbers separated by commas.")
+            return
+
+    st.info(f"🪑 **Total System Capacity:** {total_system_capacity} Seats | **Total Students:** {len(df)}")
+    if len(df) > total_system_capacity:
+        st.error(f"⚠️ Warning: Not enough seats! You are short by {len(df) - total_system_capacity} seats. Add more rooms or rows.")
+
+    # Distribute Data
+    allocated_rooms, unassigned = distribute_to_rooms(df, rooms_config, separate_genders)
+
+    if unassigned:
+        st.error(f"⚠️ {len(unassigned)} students could not be seated due to lack of space or strict gender isolation rules.")
+        with st.expander("View Unassigned Students"):
+            st.dataframe(unassigned)
+
+    # Room Preview Summary
+    st.subheader("📊 Allocation Preview")
+    preview_data = []
+    for config in rooms_config:
+        r_name = config["name"]
+        students = allocated_rooms[r_name]
+        b_count = sum(1 for s in students if s["gender"] == "BOYS")
+        g_count = sum(1 for s in students if s["gender"] == "GIRLS")
+        preview_data.append({
+            "Room Name": r_name,
+            "Assigned Boys": b_count,
+            "Assigned Girls": g_count,
+            "Total Occupied": f"{len(students)} / {config['capacity']}"
+        })
+    st.dataframe(pd.DataFrame(preview_data).set_index("Room Name"), use_container_width=True)
+
+    # Generate PDF
+    if st.button("🖨️ Generate Seating Arrangement PDF", type="primary"):
+        with st.spinner("Calculating matrices and rendering PDF..."):
+            try:
+                pdf_buf = generate_pdf(allocated_rooms, rooms_config)
+                st.balloons()
+                st.download_button(
+                    label="📥 Download Seating PDF",
+                    data=pdf_buf,
+                    file_name="Custom_Seating_Arrangement.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+            except Exception as e:
+                st.error(f"PDF generation failed: {e}")
+                st.exception(e)
+
+if __name__ == "__main__":
+    main()

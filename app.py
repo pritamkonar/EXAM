@@ -6,6 +6,7 @@ Streamlit app to auto-generate exam seating from Excel student data.
 import streamlit as st
 import pandas as pd
 import io
+import math
 from collections import defaultdict
 
 from reportlab.lib.pagesizes import A4
@@ -17,12 +18,10 @@ from reportlab.platypus import (
 )
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
-from reportlab.graphics.shapes import Drawing, Rect, String, Line
+from reportlab.graphics.shapes import Drawing, Rect, String
 from reportlab.graphics import renderPDF
 
 # ─── Constants ───────────────────────────────────────────────────────────────
-
-CLASS_ORDER = ["V", "VI", "VII", "VIII", "IX", "X"]
 
 CLASS_COLORS = {
     "V":    "#4CAF50",
@@ -33,19 +32,7 @@ CLASS_COLORS = {
     "X":    "#FF9800",
 }
 
-# IX & X Boys → rooms 2,3,4 | IX & X Girls → rooms 1,5
-# Classes V–VIII → all 5 rooms
-ROOM_TARGETS = {
-    "IX": {"BOYS": [2, 3, 4], "GIRLS": [1, 5]},
-    "X":  {"BOYS": [2, 3, 4], "GIRLS": [1, 5]},
-    **{c: {"BOYS": [1,2,3,4,5], "GIRLS": [1,2,3,4,5]} for c in ["V","VI","VII","VIII"]},
-}
-
-# Bench column counts per room (used for visual diagram)
-ROOM_BENCH_COLS = {1: 11, 2: 6, 3: 6, 4: 6, 5: 9}
-
 SCHOOL_NAME = "1st Summative Evaluation 2026"
-
 
 # ─── Data Ingestion ──────────────────────────────────────────────────────────
 
@@ -58,7 +45,6 @@ def _normalize_class(raw):
         if s.startswith(prefix):
             return cls
     return None
-
 
 def read_students(file) -> pd.DataFrame:
     """Read Sheet1, extract class / roll / name / gender columns."""
@@ -79,32 +65,79 @@ def read_students(file) -> pd.DataFrame:
         rows.append({"class": cls, "roll": roll, "name": name, "gender": gender})
 
     df_out = pd.DataFrame(rows)
-    return df_out.sort_values(["class", "gender", "roll"]).reset_index(drop=True)
+    if not df_out.empty:
+        return df_out.sort_values(["class", "gender", "roll"]).reset_index(drop=True)
+    return df_out
 
+# ─── Dynamic Room Distribution ───────────────────────────────────────────────
 
-# ─── Room Distribution ───────────────────────────────────────────────────────
+def distribute_to_rooms(df: pd.DataFrame, rooms_config: list, separate_genders: bool) -> tuple[dict, list]:
+    """Distributes students into available rooms based on configured capacity and rules."""
+    allocated_rooms = {r["name"]: [] for r in rooms_config}
+    unassigned_students = []
+    
+    # Calculate capacities: capacity = total benches * 3 seats per bench
+    room_capacities = {r["name"]: sum(r["cols"]) * 3 for r in rooms_config}
+    room_gender_locks = {r["name"]: None for r in rooms_config}
+    
+    # Helper to round-robin pop from available classes to ensure mixed seating
+    def pop_mixed_student(student_dict):
+        available_classes = [c for c in student_dict.keys() if len(student_dict[c]) > 0]
+        if not available_classes:
+            return None
+        # Sort by largest remaining to ensure even distribution
+        available_classes.sort(key=lambda c: len(student_dict[c]), reverse=True)
+        return student_dict[available_classes[0]].pop(0)
 
-def distribute_to_rooms(df: pd.DataFrame) -> dict[int, list[dict]]:
-    rooms: dict[int, list] = {i: [] for i in range(1, 6)}
+    # Convert df to dictionary of queues grouped by gender then class
+    queues = {"BOYS": defaultdict(list), "GIRLS": defaultdict(list)}
+    for s in df.to_dict("records"):
+        queues[s["gender"]][s["class"]].append(s)
 
-    for cls in CLASS_ORDER:
-        for gender in ["BOYS", "GIRLS"]:
-            students = (
-                df[(df["class"] == cls) & (df["gender"] == gender)]
-                .to_dict("records")
-            )
-            if not students:
-                continue
-            targets = ROOM_TARGETS[cls][gender]
-            n, nr = len(students), len(targets)
-            idx = 0
-            for i, room_id in enumerate(targets):
-                chunk = n // nr + (1 if i < n % nr else 0)
-                rooms[room_id].extend(students[idx : idx + chunk])
-                idx += chunk
+    # Fill Algorithm
+    genders_to_process = ["BOYS", "GIRLS"] if separate_genders else ["MIXED"]
+    
+    if not separate_genders:
+        # Combine all genders into one queue pool if mixed
+        mixed_queues = defaultdict(list)
+        for g in ["BOYS", "GIRLS"]:
+            for c, students in queues[g].items():
+                mixed_queues[c].extend(students)
+        queues = {"MIXED": mixed_queues}
 
-    return rooms
+    for target_gender in genders_to_process:
+        active_queue = queues[target_gender]
+        
+        while any(active_queue.values()):
+            student = pop_mixed_student(active_queue)
+            if not student:
+                break
+            
+            placed = False
+            for room in rooms_config:
+                r_name = room["name"]
+                
+                # Check room capacity
+                if len(allocated_rooms[r_name]) >= room_capacities[r_name]:
+                    continue
+                
+                # Check gender lock restriction
+                if separate_genders:
+                    current_lock = room_gender_locks[r_name]
+                    if current_lock is None:
+                        room_gender_locks[r_name] = target_gender # Lock the room
+                    elif current_lock != target_gender:
+                        continue # Room is locked to the other gender
+                
+                # Place student
+                allocated_rooms[r_name].append(student)
+                placed = True
+                break
+            
+            if not placed:
+                unassigned_students.append(student)
 
+    return allocated_rooms, unassigned_students
 
 # ─── Bench Seating Algorithm ─────────────────────────────────────────────────
 
@@ -112,18 +145,18 @@ def create_bench_layout(students: list[dict]) -> list[list]:
     """
     Arrange students into bench rows of 3.
     Rule: LEFT & RIGHT seats = same class  |  MIDDLE seat = different class
-    Returns list of [left, middle, right] where any slot can be None.
     """
     groups = defaultdict(list)
     for s in students:
         groups[s["class"]].append(s)
 
-    queues = {c: list(groups[c]) for c in CLASS_ORDER if c in groups}
+    # Sort classes natively so iteration has a predictable order
+    class_order = sorted(groups.keys())
+    queues = {c: list(groups[c]) for c in class_order}
     benches = []
 
     while any(queues.values()):
-        available = [(c, queues[c]) for c in CLASS_ORDER
-                     if c in queues and queues[c]]
+        available = [(c, queues[c]) for c in class_order if queues[c]]
 
         if not available:
             break
@@ -131,12 +164,10 @@ def create_bench_layout(students: list[dict]) -> list[list]:
         if len(available) == 1:
             cls, q = available[0]
             while q:
-                triple = [q.pop(0), q.pop(0) if q else None,
-                          q.pop(0) if q else None]
+                triple = [q.pop(0), q.pop(0) if q else None, q.pop(0) if q else None]
                 benches.append(triple)
             break
 
-        # Largest queue → outer seats; second largest → middle seat
         available.sort(key=lambda x: len(x[1]), reverse=True)
         cls_a, q_a = available[0]
         cls_b, q_b = available[1]
@@ -148,7 +179,6 @@ def create_bench_layout(students: list[dict]) -> list[list]:
 
     return benches
 
-
 # ─── PDF Generation ──────────────────────────────────────────────────────────
 
 def _style(name, **kwargs):
@@ -156,32 +186,28 @@ def _style(name, **kwargs):
     base.update(kwargs)
     return ParagraphStyle(name, **base)
 
-
 def _seat_cell(student):
     if student is None:
         return "—"
     g = "Boy" if student["gender"] == "BOYS" else "Girl"
     return f"Roll: {student['roll']}\nClass {student['class']}  [{g}]\n{student['name']}"
 
-
-def _room_diagram(benches: list[list], room_id: int) -> Drawing:
-    """
-    Draw a top-down classroom layout.
-    Each bench = a small labeled rectangle with 3 seat circles.
-    At most 10 benches per row in the diagram; rows wrap.
-    """
-    COLS = ROOM_BENCH_COLS[room_id]      # visual columns
-    B_W, B_H = 50, 34                   # bench box width / height (pt)
+def _room_diagram(benches: list[list], room_config: dict) -> Drawing:
+    """Draws a top-down classroom layout specifically mapped to custom columns."""
+    col_heights = room_config["cols"]
+    B_W, B_H = 50, 34                    
     GAP_X, GAP_Y = 8, 8
     SEAT_R = 6
 
-    total_benches = len(benches)
-    rows = (total_benches + COLS - 1) // COLS
+    COLS = len(col_heights)
+    max_rows = max(col_heights) if col_heights else 1
+    
     dw = COLS * (B_W + GAP_X) + GAP_X
-    dh = rows * (B_H + GAP_Y) + GAP_Y + 22  # 22 = top label
+    dh = max_rows * (B_H + GAP_Y) + GAP_Y + 22  
+
     d = Drawing(dw, dh)
 
-    # blackboard
+    # Blackboard
     board_w = min(dw * 0.6, 200)
     bx = (dw - board_w) / 2
     d.add(Rect(bx, dh - 20, board_w, 14,
@@ -191,45 +217,45 @@ def _room_diagram(benches: list[list], room_id: int) -> Drawing:
                  fontName="Helvetica-Bold", fontSize=7,
                  fillColor=colors.white, textAnchor="middle"))
 
-    for idx, bench in enumerate(benches):
-        col = idx % COLS
-        row = idx // COLS
-        x = GAP_X + col * (B_W + GAP_X)
-        y = dh - 22 - (row + 1) * (B_H + GAP_Y)
+    bench_idx = 0
+    # Map benches column by column based on the manual configuration
+    for col_idx, rows_in_col in enumerate(col_heights):
+        for row_idx in range(rows_in_col):
+            if bench_idx >= len(benches):
+                break
+                
+            bench = benches[bench_idx]
+            x = GAP_X + col_idx * (B_W + GAP_X)
+            y = dh - 22 - (row_idx + 1) * (B_H + GAP_Y)
 
-        # Determine fill color from class of first occupied seat
-        cls = next((s["class"] for s in bench if s), "V")
-        fill_hex = CLASS_COLORS.get(cls, "#90caf9")
-        fill = colors.HexColor(fill_hex)
-        light = colors.HexColor(fill_hex + "55")  # approximate lighter
+            cls = next((s["class"] for s in bench if s), "V")
+            fill_hex = CLASS_COLORS.get(cls, "#90caf9")
+            fill = colors.HexColor(fill_hex)
 
-        d.add(Rect(x, y, B_W, B_H,
-                   fillColor=colors.HexColor("#e3f2fd"),
-                   strokeColor=colors.HexColor("#90caf9"), strokeWidth=0.8))
+            d.add(Rect(x, y, B_W, B_H,
+                       fillColor=colors.HexColor("#e3f2fd"),
+                       strokeColor=colors.HexColor("#90caf9"), strokeWidth=0.8))
 
-        # Bench label
-        d.add(String(x + B_W / 2, y + B_H - 9,
-                     f"B{idx+1}",
-                     fontName="Helvetica-Bold", fontSize=6,
-                     fillColor=colors.HexColor("#1a237e"), textAnchor="middle"))
+            d.add(String(x + B_W / 2, y + B_H - 9,
+                         f"B{bench_idx+1}",
+                         fontName="Helvetica-Bold", fontSize=6,
+                         fillColor=colors.HexColor("#1a237e"), textAnchor="middle"))
 
-        # 3 seat circles: left, middle, right
-        seat_positions = [
-            (x + 10, y + 10),
-            (x + B_W / 2, y + 10),
-            (x + B_W - 10, y + 10),
-        ]
-        seat_labels = ["L", "M", "R"]
-        for sp_x, sp_y in seat_positions:
-            d.add(Rect(sp_x - SEAT_R, sp_y - SEAT_R,
-                       SEAT_R * 2, SEAT_R * 2,
-                       fillColor=fill,
-                       strokeColor=colors.HexColor("#37474f"), strokeWidth=0.6))
+            seat_positions = [
+                (x + 10, y + 10),
+                (x + B_W / 2, y + 10),
+                (x + B_W - 10, y + 10),
+            ]
+            for sp_x, sp_y in seat_positions:
+                d.add(Rect(sp_x - SEAT_R, sp_y - SEAT_R,
+                           SEAT_R * 2, SEAT_R * 2,
+                           fillColor=fill,
+                           strokeColor=colors.HexColor("#37474f"), strokeWidth=0.6))
+            bench_idx += 1
 
     return d
 
-
-def generate_pdf(rooms: dict[int, list]) -> io.BytesIO:
+def generate_pdf(allocated_rooms: dict, rooms_config: list) -> io.BytesIO:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
@@ -237,14 +263,10 @@ def generate_pdf(rooms: dict[int, list]) -> io.BytesIO:
         topMargin=13 * mm, bottomMargin=13 * mm,
     )
 
-    st_exam    = _style("exam",    fontName="Helvetica-Bold", fontSize=15, spaceAfter=1*mm,
-                         textColor=colors.HexColor("#0d1b2a"))
-    st_room    = _style("room",    fontName="Helvetica-Bold", fontSize=22, spaceAfter=3*mm,
-                         textColor=colors.HexColor("#0f3460"))
-    st_section = _style("section", fontName="Helvetica-Bold", fontSize=9,  spaceAfter=2*mm,
-                         textColor=colors.HexColor("#37474f"))
-    st_footer  = _style("footer",  fontSize=7, textColor=colors.grey,
-                         fontName="Helvetica-Oblique")
+    st_exam    = _style("exam",    fontName="Helvetica-Bold", fontSize=15, spaceAfter=1*mm, textColor=colors.HexColor("#0d1b2a"))
+    st_room    = _style("room",    fontName="Helvetica-Bold", fontSize=22, spaceAfter=3*mm, textColor=colors.HexColor("#0f3460"))
+    st_section = _style("section", fontName="Helvetica-Bold", fontSize=9,  spaceAfter=2*mm, textColor=colors.HexColor("#37474f"))
+    st_footer  = _style("footer",  fontSize=7, textColor=colors.grey, fontName="Helvetica-Oblique")
 
     GREY_STRIPE = colors.HexColor("#f5f8ff")
     HDR_DARK    = colors.HexColor("#0f3460")
@@ -257,18 +279,23 @@ def generate_pdf(rooms: dict[int, list]) -> io.BytesIO:
 
     story = []
 
-    for room_id in range(1, 6):
-        if room_id > 1:
+    for idx, config in enumerate(rooms_config):
+        r_name = config["name"]
+        students = allocated_rooms[r_name]
+        
+        # Skip printing completely empty rooms
+        if not students:
+            continue
+            
+        if idx > 0:
             story.append(PageBreak())
 
-        students = rooms[room_id]
-        benches  = create_bench_layout(students)
+        benches = create_bench_layout(students)
 
         # ── Header ──────────────────────────────────────────────────────────
         story.append(Paragraph(SCHOOL_NAME, st_exam))
-        story.append(Paragraph(f"ROOM  NO. {room_id}", st_room))
-        story.append(HRFlowable(width="100%", thickness=2,
-                                 color=HDR_DARK, spaceAfter=3*mm))
+        story.append(Paragraph(str(r_name).upper(), st_room))
+        story.append(HRFlowable(width="100%", thickness=2, color=HDR_DARK, spaceAfter=3*mm))
 
         # ── Class Summary Table ──────────────────────────────────────────────
         counts = defaultdict(lambda: {"BOYS": 0, "GIRLS": 0})
@@ -277,19 +304,16 @@ def generate_pdf(rooms: dict[int, list]) -> io.BytesIO:
 
         hdr = [["Class", "Boys", "Girls", "Total"]]
         body, tb, tg = [], 0, 0
-        for cls in CLASS_ORDER:
-            if cls in counts:
-                b = counts[cls]["BOYS"]
-                g = counts[cls]["GIRLS"]
-                body.append([f"Class {cls}",
-                              str(b) if b else "–",
-                              str(g) if g else "–",
-                              str(b + g)])
-                tb += b; tg += g
+        
+        for cls in sorted(counts.keys()):
+            b = counts[cls]["BOYS"]
+            g = counts[cls]["GIRLS"]
+            body.append([f"Class {cls}", str(b) if b else "–", str(g) if g else "–", str(b + g)])
+            tb += b; tg += g
+            
         body.append(["TOTAL", str(tb), str(tg), str(tb + tg)])
 
-        summary_tbl = Table(hdr + body, colWidths=[35*mm, 24*mm, 24*mm, 24*mm],
-                            hAlign="CENTER")
+        summary_tbl = Table(hdr + body, colWidths=[35*mm, 24*mm, 24*mm, 24*mm], hAlign="CENTER")
         summary_tbl.setStyle(TableStyle([
             ("BACKGROUND",  (0, 0), (-1, 0), HDR_DARK),
             ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
@@ -309,38 +333,15 @@ def generate_pdf(rooms: dict[int, list]) -> io.BytesIO:
         story.append(Spacer(1, 4*mm))
 
         # ── Room Diagram ─────────────────────────────────────────────────────
-        story.append(Paragraph("CLASSROOM LAYOUT  (each box = 1 bench)", st_section))
-        diagram = _room_diagram(benches, room_id)
+        story.append(Paragraph(f"CLASSROOM LAYOUT  (Total Benches: {sum(config['cols'])})", st_section))
+        diagram = _room_diagram(benches, config)
         story.append(diagram)
-        story.append(Spacer(1, 4*mm))
-
-        # ── Legend ───────────────────────────────────────────────────────────
-        legend_data = [["Seat Position", "Rule", "Color in table"]]
-        legend_data += [
-            ["LEFT  &  RIGHT", "Same class as each other", "Green tint"],
-            ["MIDDLE",         "Different class from L/R",  "Orange tint"],
-        ]
-        legend_tbl = Table(legend_data, colWidths=[40*mm, 65*mm, 40*mm], hAlign="CENTER")
-        legend_tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), HDR_MID),
-            ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
-            ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE",   (0, 0), (-1,-1), 8),
-            ("ALIGN",      (0, 0), (-1,-1), "CENTER"),
-            ("VALIGN",     (0, 0), (-1,-1), "MIDDLE"),
-            ("ROWHEIGHT",  (0, 0), (-1,-1), 6*mm),
-            ("GRID",       (0, 0), (-1,-1), 0.5, colors.grey),
-            ("BACKGROUND", (0, 1), (0, 1), LEFT_BG),
-            ("BACKGROUND", (0, 2), (0, 2), MID_BG),
-        ]))
-        story.append(legend_tbl)
         story.append(Spacer(1, 4*mm))
 
         # ── Bench-by-Bench Seating Table ─────────────────────────────────────
         story.append(Paragraph("BENCH-WISE SEATING ARRANGEMENT", st_section))
 
-        bench_hdr = [["Bench\nNo.",
-                      "LEFT SEAT\n(Roll | Class | Gender | Name)",
+        bench_hdr = [["Bench\nNo.", "LEFT SEAT\n(Roll | Class | Gender | Name)",
                       "MIDDLE SEAT\n(Roll | Class | Gender | Name)",
                       "RIGHT SEAT\n(Roll | Class | Gender | Name)"]]
 
@@ -348,11 +349,7 @@ def generate_pdf(rooms: dict[int, list]) -> io.BytesIO:
         for i, bench in enumerate(benches):
             bench_rows.append([str(i + 1)] + [_seat_cell(s) for s in bench])
 
-        bench_tbl = Table(
-            bench_hdr + bench_rows,
-            colWidths=[12*mm, 53*mm, 53*mm, 53*mm],
-            repeatRows=1,
-        )
+        bench_tbl = Table(bench_hdr + bench_rows, colWidths=[12*mm, 53*mm, 53*mm, 53*mm], repeatRows=1)
 
         ts = [
             ("BACKGROUND", (0, 0), (-1, 0), HDR_MID),
@@ -380,154 +377,150 @@ def generate_pdf(rooms: dict[int, list]) -> io.BytesIO:
         # ── Footer ───────────────────────────────────────────────────────────
         story.append(Spacer(1, 3*mm))
         story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#aaaaaa")))
-        story.append(Paragraph(
-            f"Room {room_id}  ·  Total Students: {len(students)}  ·  "
-            f"Total Benches: {len(benches)}  ·  {SCHOOL_NAME}",
-            st_footer,
-        ))
+        story.append(Paragraph(f"{r_name}  ·  Total Students: {len(students)}  ·  {SCHOOL_NAME}", st_footer))
 
     doc.build(story)
     buf.seek(0)
     return buf
 
-
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
 
 def main():
-    st.set_page_config(
-        page_title="Seating Arrangement Generator",
-        page_icon="🏫",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Seating Arrangement Generator", page_icon="🏫", layout="wide")
 
-    # ── Custom CSS ────────────────────────────────────────────────────────────
     st.markdown("""
     <style>
         .main-title   { font-size:2.2rem; font-weight:800; color:#0f3460; margin-bottom:0; }
         .sub-title    { font-size:1rem;   color:#555;      margin-bottom:1.5rem; }
-        .metric-card  { background:#f0f4ff; border-radius:10px; padding:16px 20px;
-                        border-left:4px solid #0f3460; margin-bottom:8px; }
-        .metric-card h3 { margin:0; font-size:2rem; color:#0f3460; }
-        .metric-card p  { margin:0; color:#666; font-size:0.85rem; }
-        .room-badge { background:#0f3460; color:white; padding:2px 10px;
-                      border-radius:12px; font-size:0.8rem; font-weight:600; }
-        .rule-box { background:#fffde7; border:1px solid #f9a825;
-                    border-radius:8px; padding:12px 16px; margin:8px 0; }
     </style>
     """, unsafe_allow_html=True)
 
     st.markdown('<p class="main-title">🏫 Seating Arrangement Generator</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-title">1st Summative Evaluation 2026 — Automated PDF Generation</p>',
-                unsafe_allow_html=True)
+    st.markdown('<p class="sub-title">Fully Configurable Automated PDF Generation</p>', unsafe_allow_html=True)
 
-    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("ℹ️ How It Works")
-        st.markdown("""
-**Step 1** — Upload the Excel file  
-**Step 2** — Review the auto-detected student counts  
-**Step 3** — Click **Generate PDF**  
-**Step 4** — Download the seating PDF
-
----
-**Room Rules:**
-- Class IX & X **Boys** → Rooms 2, 3, 4  
-- Class IX & X **Girls** → Rooms 1, 5  
-- Classes V–VIII → All 5 rooms  
-
-**Bench Rule:**
-- Left & Right seats = **same class**  
-- Middle seat = **different class**
-        """)
+        st.header("⚙️ Configuration")
+        
+        # 1. Custom Class Selection Toggle
+        class_mode = st.radio("Class Selection", ["All Classes", "Custom Classes"])
+        
         st.markdown("---")
-        st.caption("Template columns used: Class · Roll No · Name · Gender")
-
-    # ── File Upload ───────────────────────────────────────────────────────────
-    uploaded = st.file_uploader(
-        "📂  Upload Student Excel File (.xlsx)",
-        type=["xlsx"],
-        help="Use the standard school Excel template — columns are auto-detected.",
-    )
+        # 2. Separate Genders Toggle
+        st.subheader("Gender Rules")
+        separate_genders = st.checkbox("🚫 Separate Boys & Girls into different rooms", value=False, 
+                                       help="If checked, a room will only contain either Boys or Girls exclusively.")
+        
+    uploaded = st.file_uploader("📂 Upload Student Excel File (.xlsx)", type=["xlsx"])
 
     if not uploaded:
         st.info("👆 Please upload the Excel file to begin.")
         return
 
-    # ── Read Data ─────────────────────────────────────────────────────────────
     with st.spinner("Reading Excel..."):
         try:
-            df = read_students(uploaded)
+            raw_df = read_students(uploaded)
         except Exception as e:
             st.error(f"Error reading file: {e}")
             return
+            
+    if raw_df.empty:
+        st.warning("No valid students found in the file. Check formatting.")
+        return
 
-    st.success(f"✅  Loaded **{len(df):,}** students from '{uploaded.name}'")
+    # Handle Custom Classes Filter
+    available_classes = sorted(raw_df["class"].unique())
+    if class_mode == "Custom Classes":
+        selected_classes = st.sidebar.multiselect("Select Classes to Process", available_classes, default=available_classes)
+        df = raw_df[raw_df["class"].isin(selected_classes)]
+    else:
+        df = raw_df
 
-    # ── Stats Row ─────────────────────────────────────────────────────────────
-    st.subheader("📊 Student Summary")
-    cols = st.columns(6)
-    for i, cls in enumerate(CLASS_ORDER):
-        sub = df[df["class"] == cls]
-        with cols[i]:
-            st.markdown(f"""
-            <div class="metric-card">
-              <h3>{len(sub)}</h3>
-              <p>Class {cls}<br>
-                 <span style="color:#4caf50">&#9646; {len(sub[sub.gender=='BOYS'])}B</span>&nbsp;
-                 <span style="color:#e91e63">&#9646; {len(sub[sub.gender=='GIRLS'])}G</span>
-              </p>
-            </div>""", unsafe_allow_html=True)
+    st.success(f"✅ Loaded **{len(df):,}** students to process.")
 
-    # ── Distribute to rooms ───────────────────────────────────────────────────
-    rooms = distribute_to_rooms(df)
+    # 3. Manual Room Layout Editor
+    st.subheader("🚪 Room Configuration")
+    st.markdown("Add rooms and define their seating layout. In the Layout column, enter the number of benches per column separated by commas (e.g., `6,9` means two columns of 6 and 9 benches).")
+    
+    # Default Room Data
+    default_rooms = pd.DataFrame([
+        {"Room Name": "Room 1", "Layout (comma separated)": "11,11"},
+        {"Room Name": "Room 2", "Layout (comma separated)": "6,6"},
+        {"Room Name": "Room 3", "Layout (comma separated)": "7,6"},
+        {"Room Name": "Room 4", "Layout (comma separated)": "6,6"},
+        {"Room Name": "Room 5", "Layout (comma separated)": "9,9"}
+    ])
+    
+    edited_room_df = st.data_editor(default_rooms, num_rows="dynamic", use_container_width=True)
+    
+    # Parse Edited Room Config
+    rooms_config = []
+    total_system_capacity = 0
+    for _, row in edited_room_df.iterrows():
+        name = str(row["Room Name"]).strip()
+        layout_str = str(row["Layout (comma separated)"]).strip()
+        
+        if not name or not layout_str: continue
+        
+        try:
+            # Parse commas or colons
+            layout_str = layout_str.replace(":", ",")
+            cols = [int(c.strip()) for c in layout_str.split(",") if c.strip().isdigit()]
+            if cols:
+                room_cap = sum(cols) * 3
+                total_system_capacity += room_cap
+                rooms_config.append({
+                    "name": name,
+                    "cols": cols,
+                    "capacity": room_cap
+                })
+        except ValueError:
+            st.error(f"Invalid layout format in {name}. Please use numbers separated by commas.")
+            return
 
-    # ── Room Preview Table ────────────────────────────────────────────────────
-    st.subheader("🚪 Room Distribution Preview")
+    st.info(f"🪑 **Total System Capacity:** {total_system_capacity} Seats | **Total Students:** {len(df)}")
+    if len(df) > total_system_capacity:
+        st.error(f"⚠️ Warning: Not enough seats! You are short by {len(df) - total_system_capacity} seats. Add more rooms or rows.")
 
-    room_rows = []
-    for room_id in range(1, 6):
-        counts = defaultdict(lambda: {"BOYS": 0, "GIRLS": 0})
-        for s in rooms[room_id]:
-            counts[s["class"]][s["gender"]] += 1
-        row = {"Room": f"Room {room_id}"}
-        for cls in CLASS_ORDER:
-            b = counts[cls]["BOYS"]
-            g = counts[cls]["GIRLS"]
-            row[f"Cl.{cls} B"] = b if b else ""
-            row[f"Cl.{cls} G"] = g if g else ""
-        row["Total"] = len(rooms[room_id])
-        room_rows.append(row)
+    # Distribute Data
+    allocated_rooms, unassigned = distribute_to_rooms(df, rooms_config, separate_genders)
 
-    st.dataframe(pd.DataFrame(room_rows).set_index("Room"), use_container_width=True)
+    if unassigned:
+        st.error(f"⚠️ {len(unassigned)} students could not be seated due to lack of space or strict gender isolation rules.")
+        with st.expander("View Unassigned Students"):
+            st.dataframe(unassigned)
 
-    st.markdown("""
-    <div class="rule-box">
-    🪑 <b>Seating rule applied:</b> &nbsp;
-    Left &amp; Right seats of each bench belong to the <b>same class</b>.
-    The Middle seat belongs to a <b>different class</b>.
-    </div>
-    """, unsafe_allow_html=True)
+    # Room Preview Summary
+    st.subheader("📊 Allocation Preview")
+    preview_data = []
+    for config in rooms_config:
+        r_name = config["name"]
+        students = allocated_rooms[r_name]
+        b_count = sum(1 for s in students if s["gender"] == "BOYS")
+        g_count = sum(1 for s in students if s["gender"] == "GIRLS")
+        preview_data.append({
+            "Room Name": r_name,
+            "Assigned Boys": b_count,
+            "Assigned Girls": g_count,
+            "Total Occupied": f"{len(students)} / {config['capacity']}"
+        })
+    st.dataframe(pd.DataFrame(preview_data).set_index("Room Name"), use_container_width=True)
 
-    # ── Generate PDF ──────────────────────────────────────────────────────────
-    st.subheader("📄 Generate PDF")
-
-    if st.button("🖨️  Generate Seating Arrangement PDF", type="primary",
-                  use_container_width=True):
-        with st.spinner("Generating PDF — please wait..."):
+    # Generate PDF
+    if st.button("🖨️ Generate Seating Arrangement PDF", type="primary"):
+        with st.spinner("Calculating matrices and rendering PDF..."):
             try:
-                pdf_buf = generate_pdf(rooms)
-                st.success("✅  PDF generated successfully!")
+                pdf_buf = generate_pdf(allocated_rooms, rooms_config)
+                st.balloons()
                 st.download_button(
-                    label="📥  Download Seating Arrangement PDF",
+                    label="📥 Download Seating PDF",
                     data=pdf_buf,
-                    file_name="seating_arrangement_2026.pdf",
+                    file_name="Custom_Seating_Arrangement.pdf",
                     mime="application/pdf",
-                    use_container_width=True,
+                    use_container_width=True
                 )
             except Exception as e:
                 st.error(f"PDF generation failed: {e}")
                 st.exception(e)
-
 
 if __name__ == "__main__":
     main()

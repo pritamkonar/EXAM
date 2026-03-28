@@ -524,3 +524,158 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# =========================================================================
+    # 4. NEW FEATURE: CLASS SUMMARY & STUDENT LISTS
+    # =========================================================================
+    st.markdown("---")
+    st.header("📋 Class Summary & Student Lists")
+
+    if not df.empty:
+        # 4.1 Automatic Class Summary
+        st.subheader("Class Summary")
+        
+        # Calculate Summary Data
+        summary_data = []
+        for cls in sorted(df['class'].unique()):
+            cls_df = df[df['class'] == cls]
+            boys_count = len(cls_df[cls_df['gender'] == 'BOYS'])
+            girls_count = len(cls_df[cls_df['gender'] == 'GIRLS'])
+            total = boys_count + girls_count
+            summary_data.append({
+                "Class": cls,
+                "Total Students": total,
+                "Boys": boys_count,
+                "Girls": girls_count
+            })
+        
+        summary_df = pd.DataFrame(summary_data)
+        st.dataframe(summary_df, use_container_width=True)
+
+        # PDF Generator for Summary
+        def generate_summary_pdf(sum_df):
+            buf = io.BytesIO()
+            doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15*mm, rightMargin=15*mm, topMargin=15*mm, bottomMargin=15*mm)
+            elements = []
+            
+            title_style = ParagraphStyle(name="Title", fontSize=16, alignment=TA_CENTER, fontName="Helvetica-Bold", spaceAfter=10*mm)
+            elements.append(Paragraph(f"{SCHOOL_NAME} - Class Summary", title_style))
+            
+            data = [["Class", "Total Students", "Boys", "Girls"]]
+            for _, row in sum_df.iterrows():
+                data.append([str(row['Class']), str(row['Total Students']), str(row['Boys']), str(row['Girls'])])
+                
+            t = Table(data, colWidths=[40*mm, 40*mm, 40*mm, 40*mm])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#0f3460")),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0,0), (-1,0), 8),
+                ('BACKGROUND', (0,1), (-1,-1), colors.HexColor("#f5f8ff")),
+                ('GRID', (0,0), (-1,-1), 1, colors.black),
+            ]))
+            elements.append(t)
+            doc.build(elements)
+            buf.seek(0)
+            return buf
+
+        sum_pdf_buf = generate_summary_pdf(summary_df)
+        st.download_button(
+            label="📥 Download Class Summary PDF",
+            data=sum_pdf_buf,
+            file_name="Class_Summary.pdf",
+            mime="application/pdf"
+        )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # 4.2 & 4.3 & 4.4 Class-wise Student List PDF Generator
+        st.subheader("Generate Class-wise Student List")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            list_option = st.radio("Select Generation Mode:", ["All Classes", "Selected Class Only"])
+        
+        selected_cls_list = []
+        with col2:
+            if list_option == "Selected Class Only":
+                selected_cls = st.selectbox("Choose Class", sorted(df['class'].unique()))
+                selected_cls_list = [selected_cls]
+            else:
+                selected_cls_list = sorted(df['class'].unique())
+
+        def generate_student_list_pdf(student_df, classes_to_print):
+            buf = io.BytesIO()
+            doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15*mm, rightMargin=15*mm, topMargin=15*mm, bottomMargin=15*mm)
+            elements = []
+            
+            title_style = ParagraphStyle(name="Title", fontSize=16, alignment=TA_CENTER, fontName="Helvetica-Bold", spaceAfter=2*mm)
+            subtitle_style = ParagraphStyle(name="Sub", fontSize=14, alignment=TA_CENTER, fontName="Helvetica-Bold", spaceAfter=6*mm)
+            gender_style = ParagraphStyle(name="Gender", fontSize=12, alignment=TA_CENTER, fontName="Helvetica-Bold", spaceAfter=3*mm, spaceBefore=6*mm)
+            
+            for idx, cls in enumerate(classes_to_print):
+                if idx > 0:
+                    elements.append(PageBreak())
+                
+                cls_data = student_df[student_df['class'] == cls]
+                
+                # Header
+                elements.append(Paragraph(f"{SCHOOL_NAME}", title_style))
+                elements.append(Paragraph(f"Class: {cls} - Student List", subtitle_style))
+                
+                # Standard Table Style
+                tbl_style = TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#e0e0e0")),
+                    ('TEXTCOLOR', (0,0), (-1,0), colors.black),
+                    ('ALIGN', (0,0), (1,-1), 'CENTER'), # Center SL and Roll
+                    ('ALIGN', (2,0), (2,-1), 'LEFT'),   # Left align Name
+                    ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0,0), (-1,-1), 10),
+                    ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+                    ('BOTTOMPADDING', (0,0), (-1,0), 6),
+                    ('TOPPADDING', (0,0), (-1,-1), 4),
+                    ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+                ])
+                
+                # --- BOYS TABLE ---
+                boys = cls_data[cls_data['gender'] == 'BOYS'].sort_values('roll')
+                if not boys.empty:
+                    elements.append(Paragraph("BOYS", gender_style))
+                    b_data = [["SL.", "Roll Number", "Student Name"]]
+                    for i, (_, row) in enumerate(boys.iterrows(), 1):
+                        b_data.append([str(i), str(row['roll']), str(row['name'])])
+                        
+                    # colWidths sum up to ~170mm, fitting perfectly inside A4 width minus margins
+                    b_table = Table(b_data, colWidths=[20*mm, 40*mm, 110*mm], repeatRows=1)
+                    b_table.setStyle(tbl_style)
+                    elements.append(b_table)
+                
+                # --- GIRLS TABLE ---
+                girls = cls_data[cls_data['gender'] == 'GIRLS'].sort_values('roll')
+                if not girls.empty:
+                    elements.append(Paragraph("GIRLS", gender_style))
+                    g_data = [["SL.", "Roll Number", "Student Name"]]
+                    # Serial number restarts from 1 for girls
+                    for i, (_, row) in enumerate(girls.iterrows(), 1):
+                        g_data.append([str(i), str(row['roll']), str(row['name'])])
+                        
+                    g_table = Table(g_data, colWidths=[20*mm, 40*mm, 110*mm], repeatRows=1)
+                    g_table.setStyle(tbl_style)
+                    elements.append(g_table)
+
+            doc.build(elements)
+            buf.seek(0)
+            return buf
+
+        # Generate and provide download button for Student List
+        list_pdf_buf = generate_student_list_pdf(df, selected_cls_list)
+        st.download_button(
+            label="🖨️ Download Student List PDF",
+            data=list_pdf_buf,
+            file_name=f"Student_List_{list_option.replace(' ', '_')}.pdf",
+            mime="application/pdf",
+            type="primary"
+        )
+        st.markdown("---")
+    # =========================================================================

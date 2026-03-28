@@ -10,6 +10,7 @@ import math
 from collections import defaultdict
 
 import openpyxl
+import openpyxl.worksheet.pagebreak
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 
@@ -296,7 +297,11 @@ def generate_pdf(allocated_rooms: dict, rooms_config: list) -> io.BytesIO:
     return buf
 
 
-# ─── Excel Generation (Exact Format Match) ───────────────────────────────────
+# ─── Excel Generation (Exact Format Match + Auto Page Header Repeat) ─────────
+
+# Max data rows per printed page before headers must repeat
+ROWS_PER_PAGE = 29
+
 
 def generate_student_list_excel(student_df, classes_to_print):
     """
@@ -311,9 +316,12 @@ def generate_student_list_excel(student_df, classes_to_print):
       Col F  = Roll No (Girls)    width 10.29
       Col G  = Name (Girls)       width 30.29
 
-    Row 1  : A1:C1 merged → "GENDER - MALE"  |  E1:G1 merged → "GENDER - FEMALE"
-    Row 2  : Sub-headers  SL. / Roll Number / Student Name  (height 15 pt)
-    Row 3+ : Data rows  (height 11.25 pt default)
+    Pagination logic:
+      - Each printed page fits exactly ROWS_PER_PAGE (29) data rows.
+      - If boys OR girls count exceeds 29, a fresh pair of gender headers +
+        sub-headers is automatically inserted at the start of every new page
+        block so the printed output always has headers at the top of each page.
+      - Boys and girls are chunked independently and paired chunk-by-chunk.
 
     Page   : A4 Landscape
     Margins: Left 0.75" · Right 0.75" · Top 1.0" · Bottom 1.0" · Header 0.5" · Footer 0.5"
@@ -336,9 +344,71 @@ def generate_student_list_excel(student_df, classes_to_print):
         cell.alignment = alignment or ALIGN_CC
         cell.border    = border    or BORDER_ALL
 
+    def write_headers(ws, header_row):
+        """Write the two-row header block (gender titles + sub-headers) at header_row."""
+        sub_row = header_row + 1
+
+        # ── Gender title row ─────────────────────────────────────────────
+        ws.merge_cells(f"A{header_row}:C{header_row}")
+        apply(ws[f"A{header_row}"], "GENDER - MALE")
+
+        ws.merge_cells(f"E{header_row}:G{header_row}")
+        apply(ws[f"E{header_row}"], "GENDER - FEMALE")
+
+        ws[f"D{header_row}"].border = BORDER_NONE
+
+        # ── Sub-header row (height 15 pt) ────────────────────────────────
+        ws.row_dimensions[sub_row].height = 15.0
+
+        for col, label in [("A", "SL."), ("B", "Roll Number"), ("C", "Student Name")]:
+            apply(ws[f"{col}{sub_row}"], label,
+                  alignment=ALIGN_WRAP if label == "Roll Number" else ALIGN_CC)
+
+        for col, label in [("E", "SL."), ("F", "Roll Number"), ("G", "Student Name")]:
+            apply(ws[f"{col}{sub_row}"], label,
+                  alignment=ALIGN_WRAP if label == "Roll Number" else ALIGN_CC)
+
+        ws[f"D{sub_row}"].border = BORDER_NONE
+
+    def write_data_block(ws, boys_chunk, girls_chunk, data_start_row,
+                         boys_sl_offset, girls_sl_offset):
+        """
+        Write one chunk of boys + girls data starting at data_start_row.
+        sl_offset = number of rows already written in previous chunks
+                    (so SL. numbers continue from where they left off).
+        """
+        chunk_len = max(len(boys_chunk), len(girls_chunk))
+        for i in range(chunk_len):
+            row = data_start_row + i
+
+            # Boys side ──────────────────────────────────────────────────
+            if i < len(boys_chunk):
+                apply(ws[f"A{row}"], boys_sl_offset + i + 1)
+                apply(ws[f"B{row}"], boys_chunk.iloc[i]["roll"])
+                apply(ws[f"C{row}"], boys_chunk.iloc[i]["name"])
+            else:
+                for col in ("A", "B", "C"):
+                    ws[f"{col}{row}"].border = BORDER_ALL
+                    ws[f"{col}{row}"].font   = FONT
+
+            # Spacer ─────────────────────────────────────────────────────
+            ws[f"D{row}"].border = BORDER_NONE
+
+            # Girls side ─────────────────────────────────────────────────
+            if i < len(girls_chunk):
+                apply(ws[f"E{row}"], girls_sl_offset + i + 1)
+                apply(ws[f"F{row}"], girls_chunk.iloc[i]["roll"])
+                apply(ws[f"G{row}"], girls_chunk.iloc[i]["name"])
+            else:
+                for col in ("E", "F", "G"):
+                    ws[f"{col}{row}"].border = BORDER_ALL
+                    ws[f"{col}{row}"].font   = FONT
+
+        return chunk_len   # number of data rows written
+
     # ── Workbook ─────────────────────────────────────────────────────────────
     wb = openpyxl.Workbook()
-    wb.remove(wb.active)   # remove the default blank sheet
+    wb.remove(wb.active)
 
     for cls in classes_to_print:
         cls_data = student_df[student_df["class"] == cls].copy()
@@ -347,12 +417,11 @@ def generate_student_list_excel(student_df, classes_to_print):
 
         boys  = cls_data[cls_data["gender"] == "BOYS" ].sort_values("roll").reset_index(drop=True)
         girls = cls_data[cls_data["gender"] == "GIRLS"].sort_values("roll").reset_index(drop=True)
-        max_rows = max(len(boys), len(girls))
 
         ws = wb.create_sheet(title=f"Class {cls}")
 
         # ── Page setup ───────────────────────────────────────────────────────
-        ws.page_setup.paperSize   = 9             # 9 = A4
+        ws.page_setup.paperSize   = 9        # A4
         ws.page_setup.orientation = "landscape"
         ws.page_margins = PageMargins(
             left=0.75,  right=0.75,
@@ -366,67 +435,57 @@ def generate_student_list_excel(student_df, classes_to_print):
 
         # ── Column widths ─────────────────────────────────────────────────────
         ws.column_dimensions["A"].width = 9.140625
-        # Col B left at Excel default (~8.43) — do NOT set width
+        # Col B left at Excel default (~8.43)
         ws.column_dimensions["C"].width = 26.0
-        ws.column_dimensions["D"].width = 29.28515625   # spacer, no border
+        ws.column_dimensions["D"].width = 29.28515625
         ws.column_dimensions["E"].width = 9.140625
         ws.column_dimensions["F"].width = 10.28515625
         ws.column_dimensions["G"].width = 30.28515625
 
-        # ── Row 1: Merged gender headers ──────────────────────────────────────
-        ws.merge_cells("A1:C1")
-        apply(ws["A1"], "GENDER - MALE")
+        # ── Chunk boys and girls into ROWS_PER_PAGE slices ───────────────────
+        def chunks(df, size):
+            return [df.iloc[i:i + size].reset_index(drop=True)
+                    for i in range(0, max(len(df), 1), size)]
 
-        ws.merge_cells("E1:G1")
-        apply(ws["E1"], "GENDER - FEMALE")
+        boys_chunks  = chunks(boys,  ROWS_PER_PAGE)
+        girls_chunks = chunks(girls, ROWS_PER_PAGE)
 
-        ws["D1"].border = BORDER_NONE   # spacer
+        # Pad shorter list with empty DataFrames so both have same length
+        num_pages = max(len(boys_chunks), len(girls_chunks))
+        empty_df  = pd.DataFrame(columns=boys.columns)
+        while len(boys_chunks)  < num_pages: boys_chunks.append(empty_df)
+        while len(girls_chunks) < num_pages: girls_chunks.append(empty_df)
 
-        # ── Row 2: Sub-headers (height = 15 pt) ───────────────────────────────
-        ws.row_dimensions[2].height = 15.0
+        # ── Write each page block ─────────────────────────────────────────────
+        current_row   = 1   # next Excel row to write into
+        boys_written  = 0
+        girls_written = 0
 
-        for col, label in [("A", "SL."), ("B", "Roll Number"), ("C", "Student Name")]:
-            apply(
-                ws[f"{col}2"],
-                label,
-                alignment=ALIGN_WRAP if label == "Roll Number" else ALIGN_CC
+        for page_idx in range(num_pages):
+            b_chunk = boys_chunks[page_idx]
+            g_chunk = girls_chunks[page_idx]
+
+            # Write 2-row header block
+            write_headers(ws, current_row)
+            data_start = current_row + 2          # data begins after 2 header rows
+
+            # Set a manual page break before every page block except the first
+            if page_idx > 0:
+                ws.row_breaks.append(
+                    openpyxl.worksheet.pagebreak.Break(id=current_row - 1)
+                )
+
+            # Write data rows for this chunk
+            rows_written = write_data_block(
+                ws, b_chunk, g_chunk,
+                data_start,
+                boys_written,
+                girls_written
             )
 
-        for col, label in [("E", "SL."), ("F", "Roll Number"), ("G", "Student Name")]:
-            apply(
-                ws[f"{col}2"],
-                label,
-                alignment=ALIGN_WRAP if label == "Roll Number" else ALIGN_CC
-            )
-
-        ws["D2"].border = BORDER_NONE   # spacer
-
-        # ── Data rows (row 3 onwards, height = default 11.25 pt) ──────────────
-        for i in range(max_rows):
-            row = i + 3   # Excel row number
-
-            # ── Boys side: A, B, C ─────────────────────────────────────────
-            if i < len(boys):
-                apply(ws[f"A{row}"], i + 1)
-                apply(ws[f"B{row}"], boys.loc[i, "roll"])
-                apply(ws[f"C{row}"], boys.loc[i, "name"])
-            else:
-                for col in ("A", "B", "C"):
-                    ws[f"{col}{row}"].border = BORDER_ALL
-                    ws[f"{col}{row}"].font   = FONT
-
-            # ── Spacer column D ────────────────────────────────────────────
-            ws[f"D{row}"].border = BORDER_NONE
-
-            # ── Girls side: E, F, G ────────────────────────────────────────
-            if i < len(girls):
-                apply(ws[f"E{row}"], i + 1)
-                apply(ws[f"F{row}"], girls.loc[i, "roll"])
-                apply(ws[f"G{row}"], girls.loc[i, "name"])
-            else:
-                for col in ("E", "F", "G"):
-                    ws[f"{col}{row}"].border = BORDER_ALL
-                    ws[f"{col}{row}"].font   = FONT
+            boys_written  += len(b_chunk)
+            girls_written += len(g_chunk)
+            current_row    = data_start + rows_written   # advance cursor
 
     # ── Save & return ─────────────────────────────────────────────────────────
     buf = io.BytesIO()

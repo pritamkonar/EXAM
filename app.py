@@ -615,141 +615,58 @@ def main():
         # ── Student List PDF ─────────────────────────────────────────────────
         def generate_student_list_pdf(student_df, classes_to_print):
             """
-            A4 Landscape PDF that exactly mirrors the Excel printout:
-              - Side-by-side: GENDER - MALE (Class X)  |  GENDER - FEMALE (Class X)
-              - Sub-headers : SL. | Roll Number | Student Name  on both sides
-              - 29 data rows per page; headers repeat on every new page block
-              - Thin borders on all data cells; spacer gap between male/female
-              - Calibri-equivalent (Helvetica) 8pt font
+            A4 Landscape PDF — one table per class with repeatRows=2.
+            ReportLab auto-splits the table across pages and repeats the
+            2 header rows (gender title + sub-headers) at the top of every
+            new page automatically — no manual chunking needed here.
+
+            Layout:  GENDER - MALE (Class X)  |  gap  |  GENDER - FEMALE (Class X)
+                     SL. | Roll Number | Name  |       |  SL. | Roll Number | Name
+                     data rows …
             """
             from reportlab.lib.pagesizes import landscape
 
-            A4_L = landscape(A4)   # (841.89pt, 595.28pt) = 297mm x 210mm
+            A4_L = landscape(A4)          # 841.89pt × 595.28pt  (297mm × 210mm)
 
-            # Margins matching Excel: L/R = 0.75" = 19.05mm, T/B = 1.0" = 25.4mm
-            L_MAR = 0.75 * 25.4 * mm
+            # Margins exactly matching the Excel page setup
+            L_MAR = 0.75 * 25.4 * mm     # 0.75 inch
             R_MAR = 0.75 * 25.4 * mm
-            T_MAR = 1.0  * 25.4 * mm
+            T_MAR = 1.0  * 25.4 * mm     # 1.0 inch
             B_MAR = 1.0  * 25.4 * mm
 
-            usable_w = A4_L[0] - L_MAR - R_MAR   # ≈ 258.9mm in points
+            usable_w = A4_L[0] - L_MAR - R_MAR   # ≈ 733 pt
 
-            # ── Column widths (7 cols: 0-2 Boys | 3 Spacer | 4-6 Girls) ──────
-            # Proportional to Excel units: A=9.14, B=8.43, C=26, D=~8(gap), E=9.14, F=10.29, G=30.29
-            # Total meaningful = 9.14+8.43+26 + 9.14+10.29+30.29 = 93.29 units, gap=8
-            scale   = (usable_w - 8 * mm) / 93.29
+            # ── Column widths — proportional to Excel character units ─────────
+            # Boys: A=9.14  B=8.43  C=26.0  |  gap=8mm  |  Girls: E=9.14  F=10.29  G=30.29
+            TOTAL_UNITS = 9.14 + 8.43 + 26.0 + 9.14 + 10.29 + 30.29  # 93.29
+            GAP_W       = 8 * mm
+            scale       = (usable_w - GAP_W) / TOTAL_UNITS
             CW = [
-                9.14  * scale,   # 0  SL  (Boys)
-                8.43  * scale,   # 1  Roll (Boys)
-                26.0  * scale,   # 2  Name (Boys)
-                8     * mm,      # 3  Spacer
-                9.14  * scale,   # 4  SL  (Girls)
-                10.29 * scale,   # 5  Roll (Girls)
-                30.29 * scale,   # 6  Name (Girls)
+                9.14  * scale,   # col 0  SL.   (Boys)
+                8.43  * scale,   # col 1  Roll  (Boys)
+                26.0  * scale,   # col 2  Name  (Boys)
+                GAP_W,           # col 3  spacer — no border
+                9.14  * scale,   # col 4  SL.   (Girls)
+                10.29 * scale,   # col 5  Roll  (Girls)
+                30.29 * scale,   # col 6  Name  (Girls)
             ]
 
-            # ── Shared colours / styles ───────────────────────────────────────
-            HDR_BG   = colors.HexColor("#dde8f0")   # light blue header bg
+            HDR_BG   = colors.HexColor("#dde8f0")
             HDR_FONT = "Helvetica-Bold"
             DAT_FONT = "Helvetica"
             FONT_SZ  = 8
-            THIN_CLR = colors.black
-            SPC_CLR  = colors.white                 # spacer col — no border
+            BDR_CLR  = colors.black
+            WHT      = colors.white
 
-            def make_chunk_table(b_chunk, g_chunk, cls,
-                                  boys_sl_offset, girls_sl_offset):
-                """
-                Build a 7-column ReportLab Table for one page block.
-                Rows: [gender-header] [sub-header] [data …]
-                """
-                rows = []
-
-                # Row 0 — gender title (spans cols 0-2 and 4-6)
-                rows.append([
-                    f"GENDER - MALE (Class {cls})", "", "",   # cols 0-2
-                    "",                                        # col 3 spacer
-                    f"GENDER - FEMALE (Class {cls})", "", "", # cols 4-6
-                ])
-
-                # Row 1 — sub-headers
-                rows.append([
-                    "SL.", "Roll Number", "Student Name",
-                    "",
-                    "SL.", "Roll Number", "Student Name",
-                ])
-
-                # Data rows
-                chunk_len = max(len(b_chunk), len(g_chunk))
-                for i in range(chunk_len):
-                    b_sl   = str(boys_sl_offset  + i + 1) if i < len(b_chunk) else ""
-                    b_roll = str(b_chunk.iloc[i]["roll"])  if i < len(b_chunk) else ""
-                    b_name = str(b_chunk.iloc[i]["name"])  if i < len(b_chunk) else ""
-                    g_sl   = str(girls_sl_offset + i + 1) if i < len(g_chunk) else ""
-                    g_roll = str(g_chunk.iloc[i]["roll"])  if i < len(g_chunk) else ""
-                    g_name = str(g_chunk.iloc[i]["name"])  if i < len(g_chunk) else ""
-                    rows.append([b_sl, b_roll, b_name, "", g_sl, g_roll, g_name])
-
-                n_data = chunk_len
-                n_rows = 2 + n_data   # header rows + data rows
-
-                tbl = Table(rows, colWidths=CW, repeatRows=0)
-
-                style_cmds = [
-                    # ── Global font & alignment ───────────────────────────
-                    ("FONTNAME",    (0, 0), (-1, -1), DAT_FONT),
-                    ("FONTSIZE",    (0, 0), (-1, -1), FONT_SZ),
-                    ("ALIGN",       (0, 0), (-1, -1), "CENTER"),
-                    ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
-
-                    # ── Gender title row ──────────────────────────────────
-                    ("SPAN",        (0, 0), (2, 0)),   # MALE spans cols 0-2
-                    ("SPAN",        (4, 0), (6, 0)),   # FEMALE spans cols 4-6
-                    ("FONTNAME",    (0, 0), (2, 0), HDR_FONT),
-                    ("FONTNAME",    (4, 0), (6, 0), HDR_FONT),
-                    ("BACKGROUND",  (0, 0), (2, 0), HDR_BG),
-                    ("BACKGROUND",  (4, 0), (6, 0), HDR_BG),
-
-                    # ── Sub-header row ────────────────────────────────────
-                    ("FONTNAME",    (0, 1), (2, 1), HDR_FONT),
-                    ("FONTNAME",    (4, 1), (6, 1), HDR_FONT),
-                    ("BACKGROUND",  (0, 1), (2, 1), HDR_BG),
-                    ("BACKGROUND",  (4, 1), (6, 1), HDR_BG),
-
-                    # ── Borders on Boys side (cols 0-2, all rows) ─────────
-                    ("BOX",         (0, 0), (2, n_rows - 1), 0.5, THIN_CLR),
-                    ("INNERGRID",   (0, 0), (2, n_rows - 1), 0.5, THIN_CLR),
-
-                    # ── Borders on Girls side (cols 4-6, all rows) ────────
-                    ("BOX",         (4, 0), (6, n_rows - 1), 0.5, THIN_CLR),
-                    ("INNERGRID",   (4, 0), (6, n_rows - 1), 0.5, THIN_CLR),
-
-                    # ── Spacer column — NO border, white background ────────
-                    ("BACKGROUND",  (3, 0), (3, n_rows - 1), SPC_CLR),
-                    ("LINEAFTER",   (2, 0), (2, n_rows - 1), 0, SPC_CLR),
-                    ("LINEBEFORE",  (4, 0), (4, n_rows - 1), 0, SPC_CLR),
-
-                    # ── Row heights ───────────────────────────────────────
-                    ("ROWHEIGHT",   (0, 0), (-1, 0),        14),   # gender title
-                    ("ROWHEIGHT",   (0, 1), (-1, 1),        14),   # sub-header
-                    ("ROWHEIGHT",   (0, 2), (-1, n_rows-1), 13),   # data rows
-                    ("TOPPADDING",  (0, 0), (-1, -1), 2),
-                    ("BOTTOMPADDING",(0, 0), (-1, -1), 2),
-                ]
-
-                tbl.setStyle(TableStyle(style_cmds))
-                return tbl
-
-            # ── Build PDF elements ────────────────────────────────────────────
-            buf = io.BytesIO()
-            doc = SimpleDocTemplate(
-                buf,
-                pagesize=A4_L,
+            # ── Build PDF ────────────────────────────────────────────────────
+            buf  = io.BytesIO()
+            doc  = SimpleDocTemplate(
+                buf, pagesize=A4_L,
                 leftMargin=L_MAR, rightMargin=R_MAR,
                 topMargin=T_MAR,  bottomMargin=B_MAR,
             )
-            elements = []
-
-            first_page_of_doc = True
+            elements     = []
+            first_class  = True
 
             for cls in classes_to_print:
                 cls_data = student_df[student_df["class"] == cls].copy()
@@ -759,34 +676,84 @@ def main():
                 boys  = cls_data[cls_data["gender"] == "BOYS" ].sort_values("roll").reset_index(drop=True)
                 girls = cls_data[cls_data["gender"] == "GIRLS"].sort_values("roll").reset_index(drop=True)
 
-                # chunk into ROWS_PER_PAGE slices
-                def pdf_chunks(df, size):
-                    return [df.iloc[i:i+size].reset_index(drop=True)
-                            for i in range(0, max(len(df), 1), size)]
+                # ── Build row data ────────────────────────────────────────────
+                # Row 0: gender title headers (will be repeated by repeatRows=2)
+                # Row 1: column sub-headers  (will be repeated by repeatRows=2)
+                # Row 2+: data
+                rows = [
+                    [f"GENDER - MALE (Class {cls})", "", "", "",
+                     f"GENDER - FEMALE (Class {cls})", "", ""],
+                    ["SL.", "Roll Number", "Student Name", "",
+                     "SL.", "Roll Number", "Student Name"],
+                ]
 
-                b_chunks = pdf_chunks(boys,  ROWS_PER_PAGE)
-                g_chunks = pdf_chunks(girls, ROWS_PER_PAGE)
-                empty_df = pd.DataFrame(columns=boys.columns if not boys.empty else girls.columns)
-                num_pages = max(len(b_chunks), len(g_chunks))
-                while len(b_chunks) < num_pages: b_chunks.append(empty_df)
-                while len(g_chunks) < num_pages: g_chunks.append(empty_df)
+                max_len = max(len(boys), len(girls))
+                for i in range(max_len):
+                    rows.append([
+                        str(i + 1)                  if i < len(boys)  else "",
+                        str(boys.iloc[i]["roll"])   if i < len(boys)  else "",
+                        str(boys.iloc[i]["name"])   if i < len(boys)  else "",
+                        "",   # spacer
+                        str(i + 1)                  if i < len(girls) else "",
+                        str(girls.iloc[i]["roll"])  if i < len(girls) else "",
+                        str(girls.iloc[i]["name"])  if i < len(girls) else "",
+                    ])
 
-                boys_written = 0
-                girls_written = 0
+                n = len(rows)   # total rows including both header rows
 
-                for page_idx in range(num_pages):
-                    if not first_page_of_doc:
-                        elements.append(PageBreak())
-                    first_page_of_doc = False
+                # ── Table with repeatRows=2 ───────────────────────────────────
+                # repeatRows=2 tells ReportLab: whenever this table is split
+                # across pages, repeat the first 2 rows at the top of each
+                # continuation page — so headers always appear, no gaps.
+                tbl = Table(rows, colWidths=CW, repeatRows=2)
 
-                    tbl = make_chunk_table(
-                        b_chunks[page_idx], g_chunks[page_idx], cls,
-                        boys_written, girls_written
-                    )
-                    elements.append(tbl)
+                tbl.setStyle(TableStyle([
+                    # Global
+                    ("FONTNAME",       (0, 0), (-1, -1), DAT_FONT),
+                    ("FONTSIZE",       (0, 0), (-1, -1), FONT_SZ),
+                    ("ALIGN",          (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
+                    ("TOPPADDING",     (0, 0), (-1, -1), 2),
+                    ("BOTTOMPADDING",  (0, 0), (-1, -1), 2),
 
-                    boys_written  += len(b_chunks[page_idx])
-                    girls_written += len(g_chunks[page_idx])
+                    # Row 0 — gender title: span + bold + bg
+                    ("SPAN",           (0, 0), (2, 0)),
+                    ("SPAN",           (4, 0), (6, 0)),
+                    ("FONTNAME",       (0, 0), (2, 0), HDR_FONT),
+                    ("FONTNAME",       (4, 0), (6, 0), HDR_FONT),
+                    ("BACKGROUND",     (0, 0), (2, 0), HDR_BG),
+                    ("BACKGROUND",     (4, 0), (6, 0), HDR_BG),
+
+                    # Row 1 — sub-headers: bold + bg
+                    ("FONTNAME",       (0, 1), (2, 1), HDR_FONT),
+                    ("FONTNAME",       (4, 1), (6, 1), HDR_FONT),
+                    ("BACKGROUND",     (0, 1), (2, 1), HDR_BG),
+                    ("BACKGROUND",     (4, 1), (6, 1), HDR_BG),
+
+                    # Borders — Boys side (cols 0-2)
+                    ("BOX",            (0, 0), (2, n - 1), 0.5, BDR_CLR),
+                    ("INNERGRID",      (0, 0), (2, n - 1), 0.5, BDR_CLR),
+
+                    # Borders — Girls side (cols 4-6)
+                    ("BOX",            (4, 0), (6, n - 1), 0.5, BDR_CLR),
+                    ("INNERGRID",      (4, 0), (6, n - 1), 0.5, BDR_CLR),
+
+                    # Spacer col 3 — white, zero-width borders
+                    ("BACKGROUND",     (3, 0), (3, n - 1), WHT),
+                    ("LINEAFTER",      (2, 0), (2, n - 1), 0,   WHT),
+                    ("LINEBEFORE",     (4, 0), (4, n - 1), 0,   WHT),
+
+                    # Row heights
+                    ("ROWHEIGHT",      (0, 0), (-1, 0),     15),  # gender title
+                    ("ROWHEIGHT",      (0, 1), (-1, 1),     15),  # sub-header
+                    ("ROWHEIGHT",      (0, 2), (-1, n - 1), 13),  # data rows
+                ]))
+
+                if not first_class:
+                    elements.append(PageBreak())
+                first_class = False
+
+                elements.append(tbl)
 
             doc.build(elements)
             buf.seek(0)
